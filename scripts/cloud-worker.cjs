@@ -412,19 +412,42 @@ function cleanupJobFiles(jobId) {
   try {
     while (!stopping && Date.now() < deadline && jobsCompleted < maxJobsPerRun) {
       if (controllerPaused) {
-        console.log('Hub or worker is paused. Waiting 15s to recheck...');
-        await pause(15000);
-        await beat();
-        if (controllerPaused) {
-          await pause(15000);
-          continue;
+        if (process.env.GITHUB_ACTIONS === 'true') {
+          console.log('Hub or worker is paused. Exiting GitHub runner cleanly.');
+          break;
         }
+        console.log('Hub or worker is paused. Waiting 60s to recheck...');
+        await pause(60000);
+        await beat();
+        continue;
       }
       await ensureMemoryThreshold();
       const next = await api('claim', {});
-      if (next.paused || !next.job) {
-        console.log(next.paused ? 'Hub is paused.' : 'No more queued jobs available.');
-        break;
+      if (next.paused) {
+        console.log('Hub is paused.');
+        if (process.env.GITHUB_ACTIONS === 'true') break;
+        controllerPaused = true;
+        await pause(60000);
+        continue;
+      }
+      if (!next.job) {
+        try {
+          const feed = await api('live-feed');
+          const q = Number(feed?.counts?.jobsQueued ?? -1);
+          const r = Number(feed?.counts?.jobsRunning ?? -1);
+          if (q === 0 && r === 0) {
+            await api('toggle-collection', { paused: true }).catch(() => {});
+            console.log('All Cambridgeshire jobs completed — collection auto-paused for further instructions.');
+          } else {
+            console.log(`No queued jobs right now (${r} still running).`);
+          }
+        } catch {
+          console.log('No more queued jobs available right now.');
+        }
+        if (process.env.GITHUB_ACTIONS === 'true') break;
+        controllerPaused = true;
+        await pause(60000);
+        continue;
       }
       current = next.job;
       console.log(`[Job ${jobsCompleted + 1}/${maxJobsPerRun}] Assigned: ${current.query} @ ${current.lat},${current.lon} (Available RAM: ${getAvailableMemMB()}MB)`);
