@@ -1,0 +1,10 @@
+node_modules/
+data/
+results/
+bin/
+runtime/
+worker-config.json
+.env
+*.log
+*.jsonl
+*.csv

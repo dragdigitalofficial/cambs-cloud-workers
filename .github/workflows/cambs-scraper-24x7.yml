@@ -1,0 +1,93 @@
+name: 24/7 Cloud Scraper Workers
+
+on:
+  push:
+    branches:
+      - main
+  schedule:
+    # Runs every 2 hours with 110-minute shifts across 4 parallel 7GB runners
+    - cron: '0 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      max_runtime_minutes:
+        description: 'Max runtime in minutes per runner (default 110)'
+        required: false
+        default: '110'
+      max_jobs:
+        description: 'Max jobs per runner session (default 120)'
+        required: false
+        default: '120'
+
+jobs:
+  scrape-and-enrich:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: cambs-public-slot-${{ matrix.worker_slot }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        worker_slot: [1, 2, 3, 4]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup Go 1.23
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Cache compiled google-maps-scraper binary
+        id: cache-scraper
+        uses: actions/cache@v4
+        with:
+          path: bin/google-maps-scraper
+          key: gmaps-scraper-linux-v1.18.1-patched-v3
+
+      - name: Build patched gosom/google-maps-scraper v1.18.1 (if not cached)
+        if: steps.cache-scraper.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p bin /tmp/gmaps-src
+          git clone --depth 1 --branch v1.18.1 https://github.com/gosom/google-maps-scraper.git /tmp/gmaps-src
+          node scripts/patch-scraper-source.cjs /tmp/gmaps-src
+          cd /tmp/gmaps-src
+          go build -o "$GITHUB_WORKSPACE/bin/google-maps-scraper" .
+          chmod +x "$GITHUB_WORKSPACE/bin/google-maps-scraper"
+
+      - name: Cache Playwright browsers
+        id: cache-pw
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-1.48.0
+
+      - name: Install Playwright Chromium & system dependencies
+        run: |
+          if [ "${{ steps.cache-pw.outputs.cache-hit }}" != "true" ]; then
+            npx --yes playwright@1.48.0 install --with-deps chromium
+          else
+            npx --yes playwright@1.48.0 install-deps chromium
+          fi
+          ./bin/google-maps-scraper -help >/dev/null 2>&1 || true
+
+      - name: Run Cloud Worker (4x parallel tabs on 7GB runner)
+        env:
+          WASMER_SITE: ${{ secrets.WASMER_SITE || 'https://cambs-collector.wasmer.app' }}
+          WASMER_WORKER_ID: ${{ secrets.WASMER_WORKER_ID }}
+          WASMER_WORKER_TOKEN: ${{ secrets.WASMER_WORKER_TOKEN }}
+          WASMER_WORKER_NAME: 'GitHub-Public-Slot-${{ matrix.worker_slot }}'
+          SCRAPE_CONCURRENCY: '4'
+          SCRAPE_BROWSER_POOL: '2'
+          SCRAPE_PAGES_PER_BROWSER: '2'
+          SCRAPE_DEPTH: '3'
+          MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes || '110' }}
+          MAX_JOBS_PER_RUN: ${{ github.event.inputs.max_jobs || '120' }}
+        run: |
+          node scripts/cloud-worker.cjs
